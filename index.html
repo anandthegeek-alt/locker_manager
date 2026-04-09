@@ -1,35 +1,23 @@
 import React, { useState, useEffect } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, doc, setDoc, onSnapshot, updateDoc, addDoc, deleteDoc } from 'firebase/firestore';
+import { getFirestore, collection, doc, setDoc, onSnapshot, updateDoc, addDoc } from 'firebase/firestore';
 import { Lock, Unlock, User, Mail, CheckCircle, XCircle, Clock, LayoutDashboard, Send } from 'lucide-react';
 
 // --- Firebase Initialization ---
-// The environment provides these variables automatically
-let firebaseConfig = {};
-try {
-  if (typeof __firebase_config !== 'undefined' && __firebase_config) {
-    firebaseConfig = typeof __firebase_config === 'string' ? JSON.parse(__firebase_config) : __firebase_config;
-  }
-} catch (e) {
-  console.error("Failed to parse firebase config", e);
-}
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-locker-app';
 
-const isValidConfig = Object.keys(firebaseConfig).length > 0;
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
 
-const app = isValidConfig ? initializeApp(firebaseConfig) : null;
-const auth = isValidConfig ? getAuth(app) : null;
-const db = isValidConfig ? getFirestore(app) : null;
-
-// Helper for strict paths required by the environment
 const getPublicCollectionPath = (collectionName) => `artifacts/${appId}/public/data/${collectionName}`;
 
-export default function LockerManagementApp() {
+export default function App() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('user'); // 'user' or 'admin'
-  const [configError] = useState(!isValidConfig);
   
   // Data States
   const [requests, setRequests] = useState([]);
@@ -47,11 +35,6 @@ export default function LockerManagementApp() {
 
   // --- Auth Setup ---
   useEffect(() => {
-    if (!isValidConfig) {
-      setLoading(false);
-      return;
-    }
-
     const initAuth = async () => {
       try {
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
@@ -75,13 +58,12 @@ export default function LockerManagementApp() {
 
   // --- Data Fetching (Firestore Real-time Sync) ---
   useEffect(() => {
-    if (!user || !isValidConfig) return;
+    if (!user) return;
 
     // 1. Listen to Requests
     const reqRef = collection(db, getPublicCollectionPath('requests'));
     const unsubRequests = onSnapshot(reqRef, (snapshot) => {
       const fetchedRequests = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      // In-memory sort by timestamp (newest first)
       fetchedRequests.sort((a, b) => b.timestamp - a.timestamp);
       setRequests(fetchedRequests);
     }, (error) => console.error("Error fetching requests:", error));
@@ -91,7 +73,7 @@ export default function LockerManagementApp() {
     const unsubLockers = onSnapshot(lockersRef, (snapshot) => {
       let fetchedLockers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       
-      // Auto-seed lockers if none exist (Run once on first load for demo purposes)
+      // Auto-seed lockers if none exist
       if (fetchedLockers.length === 0 && snapshot.metadata.fromCache === false) {
         seedLockers();
       } else {
@@ -108,13 +90,12 @@ export default function LockerManagementApp() {
     };
   }, [user]);
 
-  // Seed 20 lockers initially
   const seedLockers = async () => {
     for (let i = 1; i <= 20; i++) {
       const lockerId = i.toString().padStart(2, '0');
       const docRef = doc(db, getPublicCollectionPath('lockers'), lockerId);
       await setDoc(docRef, {
-        status: 'available', // 'available', 'occupied'
+        status: 'available',
         occupiedBy: null,
         userName: null
       });
@@ -129,7 +110,7 @@ export default function LockerManagementApp() {
 
   const submitRequest = async (e) => {
     e.preventDefault();
-    if (!user || !isValidConfig) return;
+    if (!user) return;
     setIsSubmitting(true);
     setSuccessMsg('');
     
@@ -138,7 +119,7 @@ export default function LockerManagementApp() {
       await addDoc(reqRef, {
         ...formData,
         uid: user.uid,
-        status: 'pending', // 'pending', 'approved', 'rejected'
+        status: 'pending',
         timestamp: Date.now(),
         allocatedLocker: null
       });
@@ -153,16 +134,14 @@ export default function LockerManagementApp() {
   };
 
   const approveRequest = async (request, lockerId) => {
-    if (!lockerId || !isValidConfig) return;
+    if (!lockerId || !user) return;
     try {
-      // 1. Update Request Doc
       const reqDocRef = doc(db, getPublicCollectionPath('requests'), request.id);
       await updateDoc(reqDocRef, {
         status: 'approved',
         allocatedLocker: lockerId
       });
 
-      // 2. Update Locker Doc
       const lockerDocRef = doc(db, getPublicCollectionPath('lockers'), lockerId);
       await updateDoc(lockerDocRef, {
         status: 'occupied',
@@ -175,7 +154,7 @@ export default function LockerManagementApp() {
   };
 
   const rejectRequest = async (requestId) => {
-    if (!isValidConfig) return;
+    if (!user) return;
     try {
       const reqDocRef = doc(db, getPublicCollectionPath('requests'), requestId);
       await updateDoc(reqDocRef, { status: 'rejected' });
@@ -185,7 +164,7 @@ export default function LockerManagementApp() {
   };
 
   const releaseLocker = async (lockerId) => {
-    if (!isValidConfig) return;
+    if (!user) return;
     try {
       const lockerDocRef = doc(db, getPublicCollectionPath('lockers'), lockerId);
       await updateDoc(lockerDocRef, {
@@ -199,24 +178,12 @@ export default function LockerManagementApp() {
   };
 
   // --- Filtered Data ---
-  // Users only see their own requests (simulated by filtering via UID)
+  // Users only see their own requests
   const myRequests = requests.filter(r => r.uid === user?.uid);
   const pendingRequests = requests.filter(r => r.status === 'pending');
   const availableLockers = lockers.filter(l => l.status === 'available');
 
   // --- Render Helpers ---
-  if (configError) {
-    return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 text-gray-800 p-4 text-center">
-        <XCircle size={48} className="text-red-500 mb-4" />
-        <h2 className="text-2xl font-bold mb-2">Configuration Error</h2>
-        <p className="text-gray-600 max-w-md">
-          The application requires database credentials to run properly. The Firebase configuration is missing or invalid in this environment.
-        </p>
-      </div>
-    );
-  }
-
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-600">
@@ -341,7 +308,7 @@ export default function LockerManagementApp() {
                       <div className="flex justify-between items-start mb-2">
                         <div>
                           <p className="font-semibold text-slate-800">{new Date(req.timestamp).toLocaleDateString()}</p>
-                          <p className="text-sm text-slate-500">Req ID: {req.id.slice(0, 8)}</p>
+                          <p className="text-sm text-slate-500">Req ID: {req.id}</p>
                         </div>
                         {req.status === 'pending' && <span className="bg-yellow-100 text-yellow-800 text-xs px-2.5 py-1 rounded-full font-medium flex items-center gap-1"><Clock size={12}/> Pending</span>}
                         {req.status === 'approved' && <span className="bg-green-100 text-green-800 text-xs px-2.5 py-1 rounded-full font-medium flex items-center gap-1"><CheckCircle size={12}/> Approved</span>}
@@ -538,7 +505,7 @@ function AdminRequestCard({ request, availableLockers, onApprove, onReject }) {
             <CheckCircle size={14} /> Approve
           </button>
           <button 
-            onClick={onReject}
+            onClick={() => onReject(request.id)}
             className="flex-1 bg-white border border-slate-300 hover:bg-red-50 hover:text-red-700 text-slate-700 text-sm font-medium py-1.5 rounded transition-colors flex items-center justify-center gap-1"
           >
             <XCircle size={14} /> Reject
