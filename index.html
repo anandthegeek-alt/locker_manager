@@ -1,0 +1,550 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, doc, setDoc, onSnapshot, updateDoc, addDoc, deleteDoc } from 'firebase/firestore';
+import { Lock, Unlock, User, Mail, CheckCircle, XCircle, Clock, LayoutDashboard, Send } from 'lucide-react';
+
+// --- Firebase Initialization ---
+// The environment provides these variables automatically
+let firebaseConfig = {};
+try {
+  if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+    firebaseConfig = typeof __firebase_config === 'string' ? JSON.parse(__firebase_config) : __firebase_config;
+  }
+} catch (e) {
+  console.error("Failed to parse firebase config", e);
+}
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-locker-app';
+
+const isValidConfig = Object.keys(firebaseConfig).length > 0;
+
+const app = isValidConfig ? initializeApp(firebaseConfig) : null;
+const auth = isValidConfig ? getAuth(app) : null;
+const db = isValidConfig ? getFirestore(app) : null;
+
+// Helper for strict paths required by the environment
+const getPublicCollectionPath = (collectionName) => `artifacts/${appId}/public/data/${collectionName}`;
+
+export default function LockerManagementApp() {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState('user'); // 'user' or 'admin'
+  const [configError] = useState(!isValidConfig);
+  
+  // Data States
+  const [requests, setRequests] = useState([]);
+  const [lockers, setLockers] = useState([]);
+  
+  // Form State
+  const [formData, setFormData] = useState({
+    userName: '',
+    employeeId: '',
+    managerName: '',
+    managerId: ''
+  });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [successMsg, setSuccessMsg] = useState('');
+
+  // --- Auth Setup ---
+  useEffect(() => {
+    if (!isValidConfig) {
+      setLoading(false);
+      return;
+    }
+
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth Error:", err);
+      }
+    };
+    initAuth();
+
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      if (!currentUser) setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // --- Data Fetching (Firestore Real-time Sync) ---
+  useEffect(() => {
+    if (!user || !isValidConfig) return;
+
+    // 1. Listen to Requests
+    const reqRef = collection(db, getPublicCollectionPath('requests'));
+    const unsubRequests = onSnapshot(reqRef, (snapshot) => {
+      const fetchedRequests = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      // In-memory sort by timestamp (newest first)
+      fetchedRequests.sort((a, b) => b.timestamp - a.timestamp);
+      setRequests(fetchedRequests);
+    }, (error) => console.error("Error fetching requests:", error));
+
+    // 2. Listen to Lockers
+    const lockersRef = collection(db, getPublicCollectionPath('lockers'));
+    const unsubLockers = onSnapshot(lockersRef, (snapshot) => {
+      let fetchedLockers = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      
+      // Auto-seed lockers if none exist (Run once on first load for demo purposes)
+      if (fetchedLockers.length === 0 && snapshot.metadata.fromCache === false) {
+        seedLockers();
+      } else {
+        // Sort lockers numerically by ID
+        fetchedLockers.sort((a, b) => parseInt(a.id) - parseInt(b.id));
+        setLockers(fetchedLockers);
+        setLoading(false);
+      }
+    }, (error) => console.error("Error fetching lockers:", error));
+
+    return () => {
+      unsubRequests();
+      unsubLockers();
+    };
+  }, [user]);
+
+  // Seed 20 lockers initially
+  const seedLockers = async () => {
+    for (let i = 1; i <= 20; i++) {
+      const lockerId = i.toString().padStart(2, '0');
+      const docRef = doc(db, getPublicCollectionPath('lockers'), lockerId);
+      await setDoc(docRef, {
+        status: 'available', // 'available', 'occupied'
+        occupiedBy: null,
+        userName: null
+      });
+    }
+  };
+
+  // --- Actions ---
+
+  const handleFormChange = (e) => {
+    setFormData({ ...formData, [e.target.name]: e.target.value });
+  };
+
+  const submitRequest = async (e) => {
+    e.preventDefault();
+    if (!user || !isValidConfig) return;
+    setIsSubmitting(true);
+    setSuccessMsg('');
+    
+    try {
+      const reqRef = collection(db, getPublicCollectionPath('requests'));
+      await addDoc(reqRef, {
+        ...formData,
+        uid: user.uid,
+        status: 'pending', // 'pending', 'approved', 'rejected'
+        timestamp: Date.now(),
+        allocatedLocker: null
+      });
+      setFormData({ userName: '', employeeId: '', managerName: '', managerId: '' });
+      setSuccessMsg("Request submitted successfully!");
+      setTimeout(() => setSuccessMsg(''), 4000);
+    } catch (error) {
+      console.error("Error submitting request:", error);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const approveRequest = async (request, lockerId) => {
+    if (!lockerId || !isValidConfig) return;
+    try {
+      // 1. Update Request Doc
+      const reqDocRef = doc(db, getPublicCollectionPath('requests'), request.id);
+      await updateDoc(reqDocRef, {
+        status: 'approved',
+        allocatedLocker: lockerId
+      });
+
+      // 2. Update Locker Doc
+      const lockerDocRef = doc(db, getPublicCollectionPath('lockers'), lockerId);
+      await updateDoc(lockerDocRef, {
+        status: 'occupied',
+        occupiedBy: request.employeeId,
+        userName: request.userName
+      });
+    } catch (error) {
+      console.error("Error approving request:", error);
+    }
+  };
+
+  const rejectRequest = async (requestId) => {
+    if (!isValidConfig) return;
+    try {
+      const reqDocRef = doc(db, getPublicCollectionPath('requests'), requestId);
+      await updateDoc(reqDocRef, { status: 'rejected' });
+    } catch (error) {
+      console.error("Error rejecting request:", error);
+    }
+  };
+
+  const releaseLocker = async (lockerId) => {
+    if (!isValidConfig) return;
+    try {
+      const lockerDocRef = doc(db, getPublicCollectionPath('lockers'), lockerId);
+      await updateDoc(lockerDocRef, {
+        status: 'available',
+        occupiedBy: null,
+        userName: null
+      });
+    } catch (error) {
+      console.error("Error releasing locker:", error);
+    }
+  };
+
+  // --- Filtered Data ---
+  // Users only see their own requests (simulated by filtering via UID)
+  const myRequests = requests.filter(r => r.uid === user?.uid);
+  const pendingRequests = requests.filter(r => r.status === 'pending');
+  const availableLockers = lockers.filter(l => l.status === 'available');
+
+  // --- Render Helpers ---
+  if (configError) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 text-gray-800 p-4 text-center">
+        <XCircle size={48} className="text-red-500 mb-4" />
+        <h2 className="text-2xl font-bold mb-2">Configuration Error</h2>
+        <p className="text-gray-600 max-w-md">
+          The application requires database credentials to run properly. The Firebase configuration is missing or invalid in this environment.
+        </p>
+      </div>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-600">
+        <div className="animate-spin mr-3"><Clock size={24} /></div>
+        <p className="text-lg font-medium">Loading Locker App...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans">
+      
+      {/* Header Navigation */}
+      <header className="bg-white border-b shadow-sm sticky top-0 z-10">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex justify-between items-center h-16">
+            <div className="flex items-center space-x-2">
+              <div className="bg-blue-600 p-2 rounded-lg text-white">
+                <Lock size={20} />
+              </div>
+              <span className="font-bold text-xl tracking-tight text-slate-900">LockerSync</span>
+            </div>
+            <nav className="flex space-x-4">
+              <button 
+                onClick={() => setActiveTab('user')}
+                className={`px-4 py-2 rounded-md font-medium transition-colors ${
+                  activeTab === 'user' ? 'bg-blue-50 text-blue-700' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900'
+                }`}
+              >
+                Employee Portal
+              </button>
+              <button 
+                onClick={() => setActiveTab('admin')}
+                className={`px-4 py-2 rounded-md font-medium transition-colors flex items-center space-x-1 ${
+                  activeTab === 'admin' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-500 hover:bg-slate-100 hover:text-slate-900'
+                }`}
+              >
+                <LayoutDashboard size={16} />
+                <span>Admin</span>
+                {pendingRequests.length > 0 && (
+                  <span className="ml-2 bg-red-500 text-white text-xs px-2 py-0.5 rounded-full">
+                    {pendingRequests.length}
+                  </span>
+                )}
+              </button>
+            </nav>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content Area */}
+      <main className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        
+        {/* --- USER TAB --- */}
+        {activeTab === 'user' && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+            
+            {/* Request Form */}
+            <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
+              <div className="mb-6">
+                <h2 className="text-2xl font-bold text-slate-800">Request a Locker</h2>
+                <p className="text-slate-500 mt-1">Submit your details to be assigned a secure locker on the floor.</p>
+              </div>
+              
+              <form onSubmit={submitRequest} className="space-y-4">
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1">Full Name</label>
+                    <input required name="userName" value={formData.userName} onChange={handleFormChange}
+                      className="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none" placeholder="John Doe" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1">Employee ID</label>
+                    <input required name="employeeId" value={formData.employeeId} onChange={handleFormChange}
+                      className="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none" placeholder="EMP12345" />
+                  </div>
+                </div>
+                
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1">Manager Name</label>
+                    <input required name="managerName" value={formData.managerName} onChange={handleFormChange}
+                      className="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none" placeholder="Jane Smith" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1">Manager ID</label>
+                    <input required name="managerId" value={formData.managerId} onChange={handleFormChange}
+                      className="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none" placeholder="EMP98765" />
+                  </div>
+                </div>
+
+                {successMsg && (
+                  <div className="bg-green-50 text-green-700 p-3 rounded-lg flex items-center gap-2 text-sm font-medium border border-green-200 mt-2">
+                    <CheckCircle size={16} /> {successMsg}
+                  </div>
+                )}
+
+                <button 
+                  type="submit" 
+                  disabled={isSubmitting}
+                  className="w-full mt-4 bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 rounded-lg transition-colors flex justify-center items-center gap-2 disabled:opacity-70"
+                >
+                  <Send size={18} />
+                  {isSubmitting ? 'Submitting...' : 'Submit Request'}
+                </button>
+              </form>
+            </div>
+
+            {/* My Requests Tracker */}
+            <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
+              <h2 className="text-xl font-bold text-slate-800 mb-4">My Requests History</h2>
+              
+              {myRequests.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-48 text-slate-400">
+                  <Mail size={40} className="mb-3 opacity-50" />
+                  <p>You haven't requested any lockers yet.</p>
+                </div>
+              ) : (
+                <div className="space-y-4 max-h-[400px] overflow-y-auto pr-2">
+                  {myRequests.map((req) => (
+                    <div key={req.id} className="p-4 border rounded-xl bg-slate-50">
+                      <div className="flex justify-between items-start mb-2">
+                        <div>
+                          <p className="font-semibold text-slate-800">{new Date(req.timestamp).toLocaleDateString()}</p>
+                          <p className="text-sm text-slate-500">Req ID: {req.id.slice(0, 8)}</p>
+                        </div>
+                        {req.status === 'pending' && <span className="bg-yellow-100 text-yellow-800 text-xs px-2.5 py-1 rounded-full font-medium flex items-center gap-1"><Clock size={12}/> Pending</span>}
+                        {req.status === 'approved' && <span className="bg-green-100 text-green-800 text-xs px-2.5 py-1 rounded-full font-medium flex items-center gap-1"><CheckCircle size={12}/> Approved</span>}
+                        {req.status === 'rejected' && <span className="bg-red-100 text-red-800 text-xs px-2.5 py-1 rounded-full font-medium flex items-center gap-1"><XCircle size={12}/> Rejected</span>}
+                      </div>
+                      
+                      {req.status === 'approved' && req.allocatedLocker && (
+                        <div className="mt-3 bg-white border border-green-200 p-3 rounded-lg flex items-center gap-3">
+                          <div className="bg-green-100 text-green-700 p-2 rounded-md">
+                            <Lock size={20} />
+                          </div>
+                          <div>
+                            <p className="text-xs text-slate-500 uppercase font-bold tracking-wider">Allocated Locker</p>
+                            <p className="text-xl font-black text-slate-800">#{req.allocatedLocker}</p>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* --- ADMIN TAB --- */}
+        {activeTab === 'admin' && (
+          <div className="space-y-8">
+            
+            {/* Analytics / Overview Cards */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div className="bg-white p-5 rounded-xl border border-slate-100 shadow-sm flex items-center gap-4">
+                <div className="bg-blue-100 p-3 rounded-lg text-blue-600"><Lock size={24} /></div>
+                <div>
+                  <p className="text-slate-500 text-sm font-medium">Total Lockers</p>
+                  <p className="text-2xl font-bold text-slate-800">{lockers.length}</p>
+                </div>
+              </div>
+              <div className="bg-white p-5 rounded-xl border border-slate-100 shadow-sm flex items-center gap-4">
+                <div className="bg-green-100 p-3 rounded-lg text-green-600"><Unlock size={24} /></div>
+                <div>
+                  <p className="text-slate-500 text-sm font-medium">Available Lockers</p>
+                  <p className="text-2xl font-bold text-slate-800">{availableLockers.length}</p>
+                </div>
+              </div>
+              <div className="bg-white p-5 rounded-xl border border-slate-100 shadow-sm flex items-center gap-4">
+                <div className="bg-yellow-100 p-3 rounded-lg text-yellow-600"><Mail size={24} /></div>
+                <div>
+                  <p className="text-slate-500 text-sm font-medium">Pending Requests</p>
+                  <p className="text-2xl font-bold text-slate-800">{pendingRequests.length}</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+              
+              {/* Inbox / Requests List */}
+              <div className="lg:col-span-1 bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden flex flex-col h-[600px]">
+                <div className="p-5 border-b bg-slate-50">
+                  <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                    <Mail size={18} /> Request Inbox
+                  </h2>
+                </div>
+                
+                <div className="overflow-y-auto flex-1 p-4 space-y-4">
+                  {pendingRequests.length === 0 ? (
+                    <div className="text-center text-slate-400 py-10">
+                      <CheckCircle size={40} className="mx-auto mb-3 opacity-30" />
+                      <p>All caught up! No pending requests.</p>
+                    </div>
+                  ) : (
+                    pendingRequests.map(req => (
+                      <AdminRequestCard 
+                        key={req.id} 
+                        request={req} 
+                        availableLockers={availableLockers}
+                        onApprove={(lockerId) => approveRequest(req, lockerId)}
+                        onReject={() => rejectRequest(req.id)}
+                      />
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {/* Visual Locker Grid */}
+              <div className="lg:col-span-2 bg-white rounded-2xl shadow-sm border border-slate-100 p-6 h-[600px] flex flex-col">
+                <div className="flex justify-between items-center mb-6">
+                  <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                    <LayoutDashboard size={18} /> Locker Allocation Matrix
+                  </h2>
+                  <div className="flex items-center gap-4 text-sm">
+                    <span className="flex items-center gap-1"><div className="w-3 h-3 rounded-full bg-green-100 border border-green-300"></div> Available</span>
+                    <span className="flex items-center gap-1"><div className="w-3 h-3 rounded-full bg-slate-100 border border-slate-300"></div> Occupied</span>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-5 gap-4 overflow-y-auto pb-4 pr-2">
+                  {lockers.map(locker => (
+                    <div 
+                      key={locker.id}
+                      className={`relative p-4 rounded-xl border flex flex-col items-center justify-center text-center transition-all ${
+                        locker.status === 'available' 
+                          ? 'bg-green-50 border-green-200 hover:bg-green-100' 
+                          : 'bg-slate-50 border-slate-200 opacity-90'
+                      }`}
+                    >
+                      <span className="text-sm font-bold text-slate-500 mb-1">#{locker.id}</span>
+                      {locker.status === 'available' ? (
+                        <Unlock size={24} className="text-green-500 mb-2" />
+                      ) : (
+                        <Lock size={24} className="text-slate-400 mb-2" />
+                      )}
+                      
+                      {locker.status === 'occupied' && (
+                        <div className="mt-1 w-full">
+                          <p className="text-xs font-semibold text-slate-700 truncate w-full" title={locker.userName}>
+                            {locker.userName}
+                          </p>
+                          <p className="text-[10px] text-slate-500 truncate">{locker.occupiedBy}</p>
+                          <button 
+                            onClick={() => releaseLocker(locker.id)}
+                            className="mt-2 text-[10px] bg-white border border-slate-300 hover:bg-red-50 hover:text-red-600 hover:border-red-200 text-slate-600 px-2 py-1 rounded w-full transition-colors"
+                          >
+                            Release
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+          </div>
+        )}
+
+      </main>
+    </div>
+  );
+}
+
+// Sub-component for individual request cards in Admin view
+function AdminRequestCard({ request, availableLockers, onApprove, onReject }) {
+  const [selectedLocker, setSelectedLocker] = useState(availableLockers[0]?.id || '');
+
+  // Update selected locker if available ones change
+  useEffect(() => {
+    if (availableLockers.length > 0 && !selectedLocker) {
+      setSelectedLocker(availableLockers[0].id);
+    }
+  }, [availableLockers]);
+
+  return (
+    <div className="border border-slate-200 rounded-xl p-4 bg-white shadow-sm hover:shadow-md transition-shadow">
+      <div className="flex gap-3 mb-3">
+        <div className="bg-slate-100 p-2 rounded-full h-10 w-10 flex items-center justify-center flex-shrink-0">
+          <User size={18} className="text-slate-600" />
+        </div>
+        <div>
+          <h4 className="font-bold text-slate-800">{request.userName}</h4>
+          <p className="text-xs text-slate-500">ID: {request.employeeId}</p>
+        </div>
+      </div>
+      
+      <div className="bg-slate-50 p-2 rounded text-xs text-slate-600 mb-4 border border-slate-100">
+        <p><span className="font-semibold">Manager:</span> {request.managerName} ({request.managerId})</p>
+        <p><span className="font-semibold">Requested on:</span> {new Date(request.timestamp).toLocaleDateString()}</p>
+      </div>
+
+      <div className="space-y-3">
+        {availableLockers.length > 0 ? (
+          <div>
+            <label className="text-xs font-semibold text-slate-600 block mb-1">Assign Locker:</label>
+            <select 
+              value={selectedLocker}
+              onChange={(e) => setSelectedLocker(e.target.value)}
+              className="w-full text-sm border-slate-200 rounded p-1.5 focus:ring-blue-500 bg-slate-50 outline-none"
+            >
+              {availableLockers.map(l => (
+                <option key={l.id} value={l.id}>Locker #{l.id}</option>
+              ))}
+            </select>
+          </div>
+        ) : (
+          <p className="text-xs text-red-500 font-semibold bg-red-50 p-2 rounded">No lockers available!</p>
+        )}
+
+        <div className="flex gap-2 pt-1">
+          <button 
+            onClick={() => onApprove(selectedLocker)}
+            disabled={availableLockers.length === 0}
+            className="flex-1 bg-green-600 hover:bg-green-700 disabled:bg-green-300 text-white text-sm font-medium py-1.5 rounded transition-colors flex items-center justify-center gap-1"
+          >
+            <CheckCircle size={14} /> Approve
+          </button>
+          <button 
+            onClick={onReject}
+            className="flex-1 bg-white border border-slate-300 hover:bg-red-50 hover:text-red-700 text-slate-700 text-sm font-medium py-1.5 rounded transition-colors flex items-center justify-center gap-1"
+          >
+            <XCircle size={14} /> Reject
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
